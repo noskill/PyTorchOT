@@ -5,31 +5,18 @@ from torchvision import datasets, transforms
 from torch.autograd import Variable
 from torch.nn import functional as F
 import numpy as np
-import pandas as pd
 
 
-def sink(M, reg, numItermax=1000, stopThr=1e-9, cuda = True):
+def sink(M, r, c, reg, numItermax=1000, epsilon=1e-9):
 
-    # we assume that no distances are null except those of the diagonal of
-    # distances
-
-    if cuda:
-        a = Variable(torch.ones((M.size()[0],)) / M.size()[0]).cuda()
-        b = Variable(torch.ones((M.size()[1],)) / M.size()[1]).cuda()
-    else:
-        a = Variable(torch.ones((M.size()[0],)) / M.size()[0])
-        b = Variable(torch.ones((M.size()[1],)) / M.size()[1])
-
+    a = r
+    b = c
     # init data
     Nini = len(a)
     Nfin = len(b)
 
-    if cuda:
-        u = Variable(torch.ones(Nini) / Nini).cuda()
-        v = Variable(torch.ones(Nfin) / Nfin).cuda()
-    else:
-        u = Variable(torch.ones(Nini) / Nini)
-        v = Variable(torch.ones(Nfin) / Nfin)
+    u = Variable(torch.ones(Nini) / Nini).to(M)
+    v = Variable(torch.ones(Nfin) / Nfin).to(M)
 
     # print(reg)
 
@@ -39,7 +26,7 @@ def sink(M, reg, numItermax=1000, stopThr=1e-9, cuda = True):
     Kp = (1 / a).view(-1, 1) * K
     cpt = 0
     err = 1
-    while (err > stopThr and cpt < numItermax):
+    while (err > epsilon and cpt < numItermax):
         uprev = u
         vprev = v
         #print(T(K).size(), u.view(u.size()[0],1).size())
@@ -51,22 +38,29 @@ def sink(M, reg, numItermax=1000, stopThr=1e-9, cuda = True):
             # we can speed up the process by checking for the error only all
             # the 10th iterations
             transp = u.view(-1, 1) * (K * v)
-            err = (torch.sum(transp) - b).norm(1).pow(2).data[0]
+            err = (torch.sum(transp) - b).norm(1).pow(2)
 
 
         cpt += 1
 
-    return torch.sum(u.view((-1, 1)) * K * v.view((1, -1)) * M)
+    P = u.view((-1, 1)) * K * v.view((1, -1))
+    return P, torch.sum(P * M)
 
 
-def sink_stabilized(M, reg, numItermax=1000, tau=1e2, stopThr=1e-9, warmstart=None, print_period=20, cuda=True):
-
-    if cuda:
-        a = Variable(torch.ones((M.size()[0],)) / M.size()[0]).cuda()
-        b = Variable(torch.ones((M.size()[1],)) / M.size()[1]).cuda()
-    else:
-        a = Variable(torch.ones((M.size()[0],)) / M.size()[0])
-        b = Variable(torch.ones((M.size()[1],)) / M.size()[1])
+def sink_stabilized(M, r, c, reg, numItermax=1000, tau=1e2, epsilon=1e-9, warmstart=None, print_period=20):
+    """
+    Compute transport matrix P and total cost
+    Parameters
+    ----------
+    M : torch.Tensor
+        distance matrix len(r) x len(c)
+    r : torch.Tensor
+        source amounts(equals to sum of rows in M)
+    c : torch.Tensor
+        target amounts(equals to sum of columns in M)
+    """
+    a = r
+    b = c
 
     # init data
     na = len(a)
@@ -76,17 +70,11 @@ def sink_stabilized(M, reg, numItermax=1000, tau=1e2, stopThr=1e-9, warmstart=No
     # we assume that no distances are null except those of the diagonal of
     # distances
     if warmstart is None:
-        if cuda:
-            alpha, beta = Variable(torch.zeros(na)).cuda(), Variable(torch.zeros(nb)).cuda()
-        else:
-            alpha, beta = Variable(torch.zeros(na)), Variable(torch.zeros(nb))
+        alpha, beta = Variable(torch.zeros(na)).to(M), Variable(torch.zeros(nb)).to(M)
     else:
         alpha, beta = warmstart
 
-    if cuda:
-        u, v = Variable(torch.ones(na) / na).cuda(), Variable(torch.ones(nb) / nb).cuda()
-    else:
-        u, v = Variable(torch.ones(na) / na), Variable(torch.ones(nb) / nb)
+    u, v = Variable(torch.ones(na) / na).to(M), Variable(torch.ones(nb) / nb).to(M)
 
     def get_K(alpha, beta):
         return torch.exp(-(M - alpha.view((na, 1)) - beta.view((1, nb))) / reg)
@@ -111,7 +99,7 @@ def sink_stabilized(M, reg, numItermax=1000, tau=1e2, stopThr=1e-9, warmstart=No
         u = torch.div(a, (K.matmul(v) + 1e-16))
 
         # remove numerical problems and store them in K
-        if torch.max(torch.abs(u)).data[0] > tau or torch.max(torch.abs(v)).data[0] > tau:
+        if torch.max(torch.abs(u)) > tau or torch.max(torch.abs(v)) > tau:
             alpha, beta = alpha + reg * torch.log(u), beta + reg * torch.log(v)
 
             if cuda:
@@ -123,9 +111,9 @@ def sink_stabilized(M, reg, numItermax=1000, tau=1e2, stopThr=1e-9, warmstart=No
 
         if cpt % print_period == 0:
             transp = get_Gamma(alpha, beta, u, v)
-            err = (torch.sum(transp) - b).norm(1).pow(2).data[0]
+            err = (torch.sum(transp) - b).norm(1).pow(2)
 
-        if err <= stopThr:
+        if err <= epsilon:
             loop = False
 
         if cpt >= numItermax:
@@ -141,7 +129,9 @@ def sink_stabilized(M, reg, numItermax=1000, tau=1e2, stopThr=1e-9, warmstart=No
 
         cpt += 1
 
-    return torch.sum(get_Gamma(alpha, beta, u, v)*M)
+    P = u.view((-1, 1)) * K * v.view((1, -1))
+    cost = torch.sum(get_Gamma(alpha, beta, u, v)*M)
+    return P, cost
 
 def pairwise_distances(x, y, method='l1'):
     n = x.size()[0]
